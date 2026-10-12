@@ -24,6 +24,9 @@ CYBER_REPORT_URL = 'https://cybercrime.gov.in/Webform/cyber_suspect.aspx'
 
 
 def db():
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
@@ -37,8 +40,13 @@ def init_db():
             category TEXT NOT NULL,
             description TEXT NOT NULL,
             reporter_id TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            caller_label TEXT NOT NULL DEFAULT ''
         )''')
+        # Safe migration for databases created by an earlier version.
+        columns = {row['name'] for row in con.execute('PRAGMA table_info(reports)').fetchall()}
+        if 'caller_label' not in columns:
+            con.execute("ALTER TABLE reports ADD COLUMN caller_label TEXT NOT NULL DEFAULT ''")
         con.execute('CREATE INDEX IF NOT EXISTS idx_reports_number ON reports(number)')
         con.execute('''CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,9 +79,10 @@ def normalize_number(raw):
 def lookup_number(raw):
     e164, parsed = normalize_number(raw)
     with db() as con:
-        rows = con.execute('SELECT category, description, created_at FROM reports WHERE number=? ORDER BY id DESC LIMIT 50', (e164,)).fetchall()
+        rows = con.execute('SELECT category, description, created_at, caller_label FROM reports WHERE number=? ORDER BY id DESC LIMIT 50', (e164,)).fetchall()
         total = con.execute('SELECT COUNT(*) FROM reports WHERE number=?', (e164,)).fetchone()[0]
         category_counts = con.execute('SELECT category, COUNT(*) n FROM reports WHERE number=? GROUP BY category ORDER BY n DESC', (e164,)).fetchall()
+        labels = con.execute("SELECT caller_label, COUNT(*) n FROM reports WHERE number=? AND TRIM(caller_label)<>'' GROUP BY caller_label ORDER BY n DESC LIMIT 10", (e164,)).fetchall()
     # Carrier and geographic metadata are library estimates, not subscriber identity or live location.
     area = geocoder.description_for_number(parsed, 'en') or 'Not available'
     carrier_name = carrier.name_for_number(parsed, 'en') or 'Not available'
@@ -85,6 +94,7 @@ def lookup_number(raw):
         'numbering_area_estimate': area,
         'carrier_estimate': carrier_name,
         'local_reports_count': total,
+        'community_caller_labels': [{'label': r['caller_label'], 'reports': r['n']} for r in labels],
         'local_report_categories': [{'category': r['category'], 'count': r['n']} for r in category_counts],
         'local_reports': [dict(r) for r in rows],
         'official_suspect_check_url': OFFICIAL_SUSPECT_URL,
@@ -145,12 +155,13 @@ def api_report():
     if category not in allowed:
         return jsonify({'error': 'Choose a valid category.'}), 400
     description = re.sub(r'\s+', ' ', str(data.get('description', '')).strip())[:500]
+    caller_label = re.sub(r'\s+', ' ', str(data.get('caller_label', '')).strip())[:100]
     if len(description) < 3:
         return jsonify({'error': 'Add a short description (at least 3 characters).'}), 400
     reporter_id = 'web-admin' if session.get('admin_ok') else 'web-anonymous'
     with db() as con:
-        con.execute('INSERT INTO reports(number, category, description, reporter_id, created_at) VALUES(?,?,?,?,?)', (number, category, description, reporter_id, now_iso()))
-    return jsonify({'ok': True, 'message': 'Report saved to this tool only. It has not been submitted to any government database.'})
+        con.execute('INSERT INTO reports(number, category, description, reporter_id, created_at, caller_label) VALUES(?,?,?,?,?,?)', (number, category, description, reporter_id, now_iso(), caller_label))
+    return jsonify({'ok': True, 'message': 'Report saved to this tool only. Any caller label is community-submitted and unverified; it is not the registered SIM owner name.'})
 
 @app.get('/api/dashboard')
 @admin_required
@@ -158,7 +169,7 @@ def api_dashboard():
     with db() as con:
         total_reports = con.execute('SELECT COUNT(*) FROM reports').fetchone()[0]
         unique_numbers = con.execute('SELECT COUNT(DISTINCT number) FROM reports').fetchone()[0]
-        reports = con.execute('SELECT number, category, description, reporter_id, created_at FROM reports ORDER BY id DESC LIMIT 100').fetchall()
+        reports = con.execute('SELECT number, category, description, reporter_id, created_at, caller_label FROM reports ORDER BY id DESC LIMIT 100').fetchall()
     return jsonify({'total_reports': total_reports, 'unique_numbers': unique_numbers, 'reports': [dict(r) for r in reports]})
 
 def twilio_verify_request(path, fields):
@@ -247,6 +258,20 @@ def otp_status():
         'purpose': 'OTP verifies access to a number, not legal subscriber identity.'
     })
 
+
+@app.errorhandler(404)
+def not_found(error):
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'API endpoint not found. Check the deployed app version and route URL.'}), 404
+    return error
+
+@app.errorhandler(500)
+def internal_error(error):
+    # Keep API failures JSON so the browser never tries to parse an HTML error page as JSON.
+    if request.path.startswith('/api/'):
+        app.logger.exception('API request failed: %s', request.path)
+        return jsonify({'error': 'The server could not complete this request. Check the Render logs for the API error.'}), 500
+    return error
 
 @app.get('/health')
 def health():
@@ -360,8 +385,12 @@ def telegram_worker():
     asyncio.run(run_bot())
 
 
+# Initialize the database when imported by Gunicorn as well as when run directly.
+init_db()
+
+# Keep exactly one Gunicorn worker when using Telegram polling in this same process.
+if BOT_TOKEN and os.getenv('DISABLE_TELEGRAM_BOT', '0') != '1':
+    threading.Thread(target=telegram_worker, daemon=True, name='telegram-bot').start()
+
 if __name__ == '__main__':
-    init_db()
-    if BOT_TOKEN:
-        threading.Thread(target=telegram_worker, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')), debug=False)
