@@ -24,9 +24,22 @@ CYBER_REPORT_URL = 'https://cybercrime.gov.in/Webform/cyber_suspect.aspx'
 
 
 def db():
+    # Render Free has no persistent disk mounted at /var/data. If the configured
+    # path is unavailable, fall back to writable temporary storage so the app can
+    # still start. This fallback is ephemeral; use a persistent disk or managed DB
+    # when reports/notes must survive redeploys and restarts.
+    global DB_PATH
     parent = os.path.dirname(DB_PATH)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Confirm the configured location is writable before SQLite opens it.
+        probe = DB_PATH + '.write-test'
+        with open(probe, 'a', encoding='utf-8'):
+            pass
+        os.remove(probe)
+    except (PermissionError, OSError):
+        DB_PATH = os.path.join('/tmp', 'bharat-number-osint.sqlite3')
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
